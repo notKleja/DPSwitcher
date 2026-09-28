@@ -67,9 +67,23 @@ Because the panel is OLED, a plain color fade would look like the screen "turnin
 ## Menu bar UI
 
 - `NSStatusItem` with an SF Symbol image (`NSImage(systemSymbolName:)`), forced to flat monochrome rendering via `NSImage.SymbolConfiguration(...).applying(.preferringMonochrome())` — the default rendering mode for some symbols is hierarchical (multi-opacity), which looks inconsistent in a menu bar icon.
-- Left-click: fade to black+blur → switch to DisplayPort → **stay covered and poll indefinitely** for the display coming back (since the user may switch back from the PC's side, not from this app).
+- Double left-click: fade to black+blur → switch to DisplayPort → **stay covered and poll indefinitely** for the display coming back (since the user may switch back from the PC's side, not from this app). A single left-click does nothing.
 - Right-click: a manual `NSMenu` with "Switch to DisplayPort" / "Switch to USB-C" (the latter covers instantly at full black+blur since there's nothing to show anyway, switches, then polls for confirmation before revealing).
 - Click-to-reset: a `NSClickGestureRecognizer` on the overlay lets the user dismiss it manually if something goes wrong, cancelling all pending animation/poll work.
+
+## Build and test
+
+From the repository root:
+
+```sh
+swiftc DPSwitcher/StatusItemClickPolicy.swift DPSwitcher/main.swift \
+  -o DPSwitcher/DPSwitcher.app/Contents/MacOS/DPSwitcher \
+  -framework Cocoa -framework QuartzCore
+
+swiftc DPSwitcher/StatusItemClickPolicy.swift Tests/StatusItemClickPolicyTests.swift \
+  -o /tmp/StatusItemClickPolicyTests
+/tmp/StatusItemClickPolicyTests
+```
 
 ## Building a Windows equivalent
 

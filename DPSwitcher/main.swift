@@ -174,19 +174,45 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         statusItem.button?.sendAction(on: [.leftMouseUp, .rightMouseUp])
 
         let menu = NSMenu()
-        menu.addItem(withTitle: "Switch to DisplayPort", action: #selector(clicked), keyEquivalent: "")
+        menu.addItem(withTitle: "Switch to DisplayPort", action: #selector(switchToDPClicked), keyEquivalent: "")
         menu.addItem(withTitle: "Switch to USB-C", action: #selector(switchBackClicked), keyEquivalent: "")
         rightClickMenu = menu
     }
 
     @objc func clicked() {
-        log("clicked() eventType=\(String(describing: NSApp.currentEvent?.type.rawValue))")
-        guard let event = NSApp.currentEvent, event.type == .rightMouseUp,
-              let menu = rightClickMenu, let button = statusItem.button else {
-            fadeToBlackThenSwitch()
+        guard let event = NSApp.currentEvent else {
+            log("clicked() ignored: no current event")
             return
         }
-        menu.popUp(positioning: nil, at: NSPoint(x: 0, y: button.bounds.height), in: button)
+
+        let mouseButton: StatusItemMouseButton
+        switch event.type {
+        case .leftMouseUp:
+            mouseButton = .left
+        case .rightMouseUp:
+            mouseButton = .right
+        default:
+            log("clicked() ignored: eventType=\(event.type.rawValue)")
+            return
+        }
+
+        let action = StatusItemClickPolicy.action(for: mouseButton, clickCount: event.clickCount)
+        log("clicked() eventType=\(event.type.rawValue) clickCount=\(event.clickCount) action=\(action)")
+
+        switch action {
+        case .ignore:
+            return
+        case .switchToDisplayPort:
+            fadeToBlackThenSwitch()
+        case .showMenu:
+            guard let menu = rightClickMenu, let button = statusItem.button else { return }
+            menu.popUp(positioning: nil, at: NSPoint(x: 0, y: button.bounds.height), in: button)
+        }
+    }
+
+    @objc func switchToDPClicked() {
+        log("switchToDPClicked()")
+        fadeToBlackThenSwitch()
     }
 
     @objc func switchBackClicked() {
@@ -212,7 +238,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         blackoutWindow = nil
     }
 
-    /// Click → fade to black + blur, then switch to DisplayPort.
+    /// Double-click → fade to black + blur, then switch to DisplayPort.
     func fadeToBlackThenSwitch() {
         log("fadeToBlackThenSwitch() start")
         resetAnimation()
