@@ -1,5 +1,6 @@
 import Cocoa
 import CoreImage
+import ServiceManagement
 
 let displayIndex = "1"
 let dpInputValue = "15"
@@ -186,7 +187,39 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         let menu = NSMenu()
         menu.addItem(withTitle: "Switch to DisplayPort", action: #selector(switchToDPClicked), keyEquivalent: "")
         menu.addItem(withTitle: "Switch to USB-C", action: #selector(switchBackClicked), keyEquivalent: "")
+        menu.addItem(.separator())
+        let loginItem = NSMenuItem(title: "Launch at Login", action: #selector(toggleLaunchAtLogin), keyEquivalent: "")
+        loginItem.target = self
+        loginItem.state = isLaunchAtLoginEnabled() ? .on : .off
+        menu.addItem(loginItem)
+        menu.addItem(.separator())
+        menu.addItem(withTitle: "Quit", action: #selector(quitClicked), keyEquivalent: "q")
         rightClickMenu = menu
+    }
+
+    func isLaunchAtLoginEnabled() -> Bool {
+        if #available(macOS 13.0, *) {
+            return SMAppService.mainApp.status == .enabled
+        }
+        return false
+    }
+
+    @objc func toggleLaunchAtLogin(_ sender: NSMenuItem) {
+        guard #available(macOS 13.0, *) else { return }
+        do {
+            if SMAppService.mainApp.status == .enabled {
+                try SMAppService.mainApp.unregister()
+            } else {
+                try SMAppService.mainApp.register()
+            }
+        } catch {
+            log("toggleLaunchAtLogin failed: \(error)")
+        }
+        sender.state = isLaunchAtLoginEnabled() ? .on : .off
+    }
+
+    @objc func quitClicked() {
+        NSApp.terminate(nil)
     }
 
     @objc func clicked() {
