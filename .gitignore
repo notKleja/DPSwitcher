@@ -2,3 +2,4 @@ DPSwitcher/DPSwitcher.app/
 *.log
 .DS_Store
 DPSwitcher/dpswitch
+MonitorBrightnessHotkeys/build/

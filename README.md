@@ -51,7 +51,7 @@ call 2: 131.4ms -> 26
 call 10: 129.9ms -> 0   (noise)
 ```
 
-Polling faster than that floor is pointless — a background-thread poll loop with an in-flight guard (skip a tick if the previous subprocess call hasn't returned yet) naturally runs at the achievable ~130ms cadence regardless of the timer interval set below that. A true low-latency version would need to replicate `m1ddc`'s in-process `IOAVServiceReadI2C` call instead of shelling out — not done here because our own from-scratch attempt at the read protocol wasn't reliable (see above).
+The app uses a one-shot timer scheduled after each read completes, rather than a continuously firing timer. It checks after 0.25 seconds initially, then waits 2 seconds between valid non-USB-C reads. Failed, empty, and known noisy `0`/`1` reads back off through 1, 2, 4, 8, 15, and 30 seconds, capped at 30 seconds. A first USB-C reading gets a confirmation check after 0.25 seconds; two consecutive USB-C readings are still required. Resetting or replacing a transition invalidates stale read completions. This reduces background work at the cost of up to about 2 seconds of normal detection latency, or about 30 seconds while recovering from missing-display failures. A true low-latency version would need to replicate `m1ddc`'s in-process `IOAVServiceReadI2C` call instead of shelling out — not done here because our own from-scratch attempt at the read protocol wasn't reliable (see above).
 
 ## Visual transition (fade-to-black + blur)
 
@@ -60,6 +60,7 @@ Because the panel is OLED, a plain color fade would look like the screen "turnin
 - **Live blur, no screenshot needed:** `NSVisualEffectView`'s live blur (used by most macOS blur effects) is driven by a private, per-instance `CABackdropLayer` that the system continuously re-manages — an externally-added `CABasicAnimation` on its blur filter's `inputRadius` gets silently overridden/ignored, so the radius can't actually be animated that way.
   - The fix: create your **own** `CABackdropLayer` directly (`NSClassFromString("CABackdropLayer")`, since it has no public header) with `windowServerAware = true` and a `groupName`. Attach your own `CAFilter` (also private, `NSClassFromString("CAFilter")`, created via `+[CAFilter filterWithType:@"gaussianBlur"]`) to its `filters` array. Because *you* own this filter instance, `CABasicAnimation(keyPath: "filters.gaussianBlur.inputRadius")` on the backdrop layer animates correctly and live-blurs whatever is behind the window across the whole window server (not just within one process).
   - Set `backdrop.scale = 1.0` for full-resolution sampling (the sample code that inspired this used `0.25` for a cheaper/softer blur).
+- **Waiting at black:** detach the live backdrop layer and clear completed animations while waiting for the monitor. Reattach the backdrop only for the reveal animation, so a hidden Mac desktop does not need continuous blur sampling.
 - **Darkening:** a separate plain black `CALayer` on top, its `opacity` animated 0→1 in perfect sync (not staggered) with the blur radius animation — using a chained `colorBrightness` CAFilter on the same backdrop layer instead produced visible clipping/"burnt" artifacts near black, so a plain composited black layer is simpler and correct.
 - **Timing:** a `CABasicAnimation` with an explicit `duration` and a `CAMediaTimingFunction(controlPoints:...)` cubic-bezier — not a `CASpringAnimation`, whose `settlingDuration` didn't match hand-computed physics parameters reliably in practice, making duration control unpredictable.
 - **Screenshot avoided:** an earlier version captured a real screenshot and animated a `CIGaussianBlur` on it for a guaranteed-correct radius ramp, but any screen-capture API (even a single `screencapture` CLI call) triggers macOS's screen-recording indicator, which was visually unwanted. The live `CABackdropLayer` approach above gives the same animatable-radius blur without that.
@@ -76,13 +77,17 @@ Because the panel is OLED, a plain color fade would look like the screen "turnin
 From the repository root:
 
 ```sh
-swiftc DPSwitcher/StatusItemClickPolicy.swift DPSwitcher/main.swift \
+swiftc DPSwitcher/InputPollPolicy.swift DPSwitcher/StatusItemClickPolicy.swift DPSwitcher/main.swift \
   -o DPSwitcher/DPSwitcher.app/Contents/MacOS/DPSwitcher \
   -framework Cocoa -framework QuartzCore
 
 swiftc DPSwitcher/StatusItemClickPolicy.swift Tests/StatusItemClickPolicyTests.swift \
   -o /tmp/StatusItemClickPolicyTests
 /tmp/StatusItemClickPolicyTests
+
+swiftc DPSwitcher/InputPollPolicy.swift Tests/InputPollPolicyTests.swift \
+  -o /tmp/InputPollPolicyTests
+/tmp/InputPollPolicyTests
 ```
 
 ## Building a Windows equivalent
@@ -91,4 +96,4 @@ The Windows side already has the DDC/CI plumbing (`dxva2.dll`). What's portable 
 
 1. **VCP polling for switch-back detection** — same problem applies: input switching doesn't trigger a device-change event, so poll `GetVCPFeatureAndVCPFeatureReply` for VCP 0x60 periodically, debounce with 2+ consecutive matching reads.
 2. **Blur transition** — Windows has no `CABackdropLayer` equivalent, but Desktop Window Manager (DWM)/Acrylic (`DWM_BLURBEHIND`, or `Windows.UI.Composition`'s `CompositionBackdropBrush`/host backdrop brush) can live-blur behind a window, and its blur amount (via a Gaussian blur effect in a Composition pipeline) is directly animatable, so this constraint doesn't apply on Windows.
-3. **Log everything** — a plain timestamped file logger (see this app's `log()` function) made every failure mode diagnosable without guessing; recommended for the Windows clone's testing phase too.
+3. **Log state changes** — record input changes and transitions, not every poll. The active log rotates at 1 MiB to a single `.previous` file. Repeated unavailable-display responses produce one state-change entry instead of continuous disk writes.

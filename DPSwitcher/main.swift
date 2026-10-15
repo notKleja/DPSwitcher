@@ -16,6 +16,13 @@ func log(_ message: String) {
     let timestamp = ISO8601DateFormatter().string(from: Date())
     let line = "[\(timestamp)] \(message)\n"
     FileHandle.standardError.write(line.data(using: .utf8)!)
+    // Bound diagnostics even if an input keeps alternating for days.
+    if let size = (try? FileManager.default.attributesOfItem(atPath: logPath)[.size]) as? NSNumber,
+       size.intValue >= 1024 * 1024 {
+        let previous = logPath + ".previous"
+        try? FileManager.default.removeItem(atPath: previous)
+        try? FileManager.default.moveItem(atPath: logPath, toPath: previous)
+    }
     if let handle = FileHandle(forWritingAtPath: logPath) {
         handle.seekToEndOfFile()
         handle.write(line.data(using: .utf8)!)
@@ -65,9 +72,9 @@ func currentInputValue() -> String? {
         task.waitUntilExit()
         let out = String(data: outPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8)?
             .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard task.terminationStatus == 0 else { return nil }
         return out
     } catch {
-        log("currentInputValue: m1ddc failed to launch: \(error)")
         return nil
     }
 }
@@ -156,8 +163,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     var blackoutWindow: NSWindow?
     var pendingWork: [DispatchWorkItem] = []
     var pollTimer: Timer?
-    var consecutiveUSBCReads = 0
+    var pollPolicy = InputPollPolicy()
+    var pollGeneration = 0
+    var lastLoggedInput: String?
     var pollInFlight = false
+    var lastLeftClickTimestamp: TimeInterval?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
@@ -196,8 +206,20 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             return
         }
 
-        let action = StatusItemClickPolicy.action(for: mouseButton, clickCount: event.clickCount)
-        log("clicked() eventType=\(event.type.rawValue) clickCount=\(event.clickCount) action=\(action)")
+        // event.clickCount never reaches 2 here, so track click timing ourselves.
+        var effectiveClickCount = event.clickCount
+        if mouseButton == .left {
+            let now = event.timestamp
+            if let last = lastLeftClickTimestamp, now - last <= NSEvent.doubleClickInterval {
+                effectiveClickCount = max(effectiveClickCount, 2)
+                lastLeftClickTimestamp = nil
+            } else {
+                lastLeftClickTimestamp = now
+            }
+        }
+
+        let action = StatusItemClickPolicy.action(for: mouseButton, clickCount: effectiveClickCount)
+        log("clicked() eventType=\(event.type.rawValue) clickCount=\(effectiveClickCount) action=\(action)")
 
         switch action {
         case .ignore:
@@ -226,6 +248,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         pendingWork.removeAll()
         pollTimer?.invalidate()
         pollTimer = nil
+        pollGeneration += 1
         func removeAllAnimationsRecursively(_ layer: CALayer?) {
             guard let layer = layer else { return }
             layer.removeAllAnimations()
@@ -315,35 +338,49 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     private func waitForReconnectThenReveal(overlay: Overlay) {
         log("waitForReconnectThenReveal: starting poll of current input value")
         pollTimer?.invalidate()
-        consecutiveUSBCReads = 0
-        let timer = Timer(timeInterval: 0.05, repeats: true) { [weak self] _ in
-            // Skip this tick if the previous poll's subprocess hasn't returned yet —
-            // avoids stacking up overlapping m1ddc/I2C calls at a 50ms cadence.
-            guard let self = self, !self.pollInFlight else { return }
+        pollGeneration += 1
+        pollPolicy = InputPollPolicy()
+        lastLoggedInput = nil
+        // A fully black cover needs no live desktop sampling or blur rendering.
+        overlay.backdropLayer?.removeAllAnimations()
+        overlay.backdropLayer?.removeFromSuperlayer()
+        overlay.blackLayer.removeAllAnimations()
+        scheduleInputPoll(overlay: overlay, generation: pollGeneration, delay: 0.25)
+    }
+
+    private func scheduleInputPoll(overlay: Overlay, generation: Int, delay: TimeInterval) {
+        guard generation == pollGeneration, blackoutWindow === overlay.window else { return }
+        let timer = Timer(timeInterval: delay, repeats: false) { [weak self] _ in
+            guard let self = self, generation == self.pollGeneration,
+                  self.blackoutWindow === overlay.window else { return }
+            self.pollTimer = nil
+            // An old session's subprocess may still be finishing after reset.
+            guard !self.pollInFlight else {
+                self.scheduleInputPoll(overlay: overlay, generation: generation, delay: 0.25)
+                return
+            }
             self.pollInFlight = true
-            // Run the m1ddc subprocess off the main thread so it never blocks
-            // animation rendering; hop back to main to touch UI/state.
             DispatchQueue.global(qos: .utility).async {
                 let value = currentInputValue()
                 DispatchQueue.main.async {
                     self.pollInFlight = false
-                    guard self.pollTimer != nil else { return }
-                    log("poll: currentInputValue=\(value ?? "nil")")
-                    if value == usbcInputValue {
-                        self.consecutiveUSBCReads += 1
-                    } else {
-                        self.consecutiveUSBCReads = 0
+                    guard generation == self.pollGeneration,
+                          self.blackoutWindow === overlay.window else { return }
+                    let result = self.pollPolicy.record(value)
+                    let state = self.pollPolicy.failures > 0 ? "unavailable" : (value ?? "unavailable")
+                    if state != self.lastLoggedInput {
+                        log("poll: input=\(state), nextCheck=\(result.delay)s")
+                        self.lastLoggedInput = state
                     }
-                    // Require 2 consecutive matching reads — a single noisy/garbled
-                    // I2C read can transiently equal any value, including 26.
-                    if self.consecutiveUSBCReads >= 2 {
-                        self.pollTimer?.invalidate()
-                        self.pollTimer = nil
+                    if result.reveal {
                         self.playReveal(overlay: overlay, source: "poll")
+                    } else {
+                        self.scheduleInputPoll(overlay: overlay, generation: generation, delay: result.delay)
                     }
                 }
             }
         }
+        timer.tolerance = min(delay * 0.1, 1)
         pollTimer = timer
         RunLoop.main.add(timer, forMode: .common)
     }
@@ -356,10 +393,16 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
         pollTimer?.invalidate()
         pollTimer = nil
+        pollGeneration += 1
         pendingWork.forEach { $0.cancel() }
         pendingWork.removeAll()
 
         if let backdropLayer = overlay.backdropLayer, let blurObj = overlay.blurObj {
+            // Restore live blur only for the short reveal animation.
+            setWithoutImplicitAnimation {
+                blurObj.setValue(maxBlurRadius, forKey: "inputRadius")
+                overlay.containerView.layer?.insertSublayer(backdropLayer, below: overlay.blackLayer)
+            }
             let blurAnim = springLikeAnimation(keyPath: "filters.gaussianBlur.inputRadius", from: maxBlurRadius, to: 0, duration: animationDuration)
             setWithoutImplicitAnimation { blurObj.setValue(0.0, forKey: "inputRadius") }
             backdropLayer.add(blurAnim, forKey: "blurRadiusOut")
